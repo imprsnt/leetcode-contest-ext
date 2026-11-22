@@ -251,40 +251,40 @@ function httpsPost(
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
-async function buildAuth(sessionCookie: string): Promise<Auth | null> {
-  try {
-    const { cookies } = await httpsGet("https://leetcode.com/", {
-      "User-Agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-      Cookie: `LEETCODE_SESSION=${sessionCookie}`,
-    });
-
-    let csrfToken = "";
-    for (const c of cookies) {
-      const m = c.match(/csrftoken=([^;]+)/);
-      if (m) {
-        csrfToken = m[1];
-        break;
+async function fetchCsrfToken(): Promise<string | null> {
+  // Fetch WITHOUT session cookie — LeetCode only sets csrftoken for fresh requests
+  for (const url of ["https://leetcode.com/", "https://leetcode.com/accounts/login/"]) {
+    try {
+      const { cookies } = await httpsGet(url, {
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+      });
+      for (const c of cookies) {
+        const m = c.match(/csrftoken=([^;]+)/);
+        if (m) {
+          out.appendLine(`[auth] csrftoken from ${url}: ${m[1].slice(0, 8)}…`);
+          return m[1];
+        }
       }
+      out.appendLine(`[auth] No csrftoken from ${url}. Cookies: ${cookies.join(" | ")}`);
+    } catch (e) {
+      out.appendLine(`[auth] GET ${url} failed: ${e}`);
     }
+  }
+  return null;
+}
 
-    if (!csrfToken) {
-      out.appendLine(
-        "[auth] No csrftoken in Set-Cookie. Cookies: " + cookies.join(" | ")
-      );
-      return null;
-    }
-
-    out.appendLine(`[auth] csrftoken: ${csrfToken.slice(0, 8)}…`);
-    return {
-      csrfToken,
-      sessionCookie,
-      cookieHeader: `LEETCODE_SESSION=${sessionCookie}; csrftoken=${csrfToken}`,
-    };
-  } catch (e) {
-    out.appendLine(`[auth] Error: ${e}`);
+async function buildAuth(sessionCookie: string): Promise<Auth | null> {
+  const csrfToken = await fetchCsrfToken();
+  if (!csrfToken) {
+    out.appendLine("[auth] Could not obtain CSRF token from leetcode.com");
     return null;
   }
+  return {
+    csrfToken,
+    sessionCookie,
+    cookieHeader: `LEETCODE_SESSION=${sessionCookie}; csrftoken=${csrfToken}`,
+  };
 }
 
 // ── LeetCode API ──────────────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 {
   "name": "leetcode-contest",
   "displayName": "LeetCode Contest",
+  "publisher": "imprsnt",
   "description": "Join LeetCode contests and auto-create C++ files for each problem",
   "version": "0.1.0",
   "engines": {

@@ -15,10 +15,11 @@ interface ContestInfo {
   questions: ContestQuestion[];
 }
 
-interface CodeSnippet {
-  lang: string;
-  langSlug: string;
-  code: string;
+interface QuestionData {
+  snippet: string | null;
+  content: string | null;
+  difficulty: string;
+  exampleTestcases: string | null;
 }
 
 interface Auth {
@@ -29,9 +30,100 @@ interface Auth {
 
 let out: vscode.OutputChannel;
 
-const FALLBACK_TEMPLATE = (title: string, questionId: string) => `/*
+// ── HTML → Markdown ───────────────────────────────────────────────────────────
+
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&le;/g, "≤")
+    .replace(/&ge;/g, "≥")
+    .replace(/&times;/g, "×")
+    .replace(/&divide;/g, "÷")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)));
+}
+
+function stripTags(html: string): string {
+  return html.replace(/<[^>]+>/g, "");
+}
+
+function htmlToMarkdown(html: string): string {
+  if (!html) {
+    return "";
+  }
+
+  let md = html;
+
+  // <pre> blocks → fenced code (strip inner tags, keep text)
+  md = md.replace(/<pre>([\s\S]*?)<\/pre>/gi, (_, inner) => {
+    const text = decodeEntities(stripTags(inner)).trim();
+    return "\n```\n" + text + "\n```\n\n";
+  });
+
+  // Superscript: 10<sup>4</sup> → 10^4
+  md = md.replace(/<sup>([\s\S]*?)<\/sup>/gi, (_, c) => "^" + stripTags(c));
+
+  // Subscript
+  md = md.replace(/<sub>([\s\S]*?)<\/sub>/gi, (_, c) => "_" + stripTags(c) + "_");
+
+  // Bold
+  md = md.replace(/<strong>([\s\S]*?)<\/strong>/gi, "**$1**");
+  md = md.replace(/<b>([\s\S]*?)<\/b>/gi, "**$1**");
+
+  // Italic
+  md = md.replace(/<em>([\s\S]*?)<\/em>/gi, "*$1*");
+  md = md.replace(/<i>([\s\S]*?)<\/i>/gi, "*$1*");
+
+  // Inline code
+  md = md.replace(/<code>([\s\S]*?)<\/code>/gi, "`$1`");
+
+  // Links
+  md = md.replace(/<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)");
+
+  // List items
+  md = md.replace(/<li>([\s\S]*?)<\/li>/gi, (_, c) => "- " + c.trim() + "\n");
+  md = md.replace(/<\/?[uo]l[^>]*>/gi, "\n");
+
+  // Paragraphs and headers
+  md = md.replace(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi, (_, lvl, c) =>
+    "#".repeat(parseInt(lvl, 10)) + " " + c.trim() + "\n\n"
+  );
+  md = md.replace(/<p>([\s\S]*?)<\/p>/gi, "$1\n\n");
+
+  // Line breaks
+  md = md.replace(/<br\s*\/?>/gi, "\n");
+
+  // Strip any remaining tags
+  md = md.replace(/<[^>]+>/g, "");
+
+  // Decode entities last (after tag removal, so < > inside code blocks survive)
+  md = decodeEntities(md);
+
+  // Collapse 3+ newlines → 2
+  md = md.replace(/\n{3,}/g, "\n\n").trim();
+
+  return md;
+}
+
+// ── Fallback .cpp template ────────────────────────────────────────────────────
+
+function slugify(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-");
+}
+
+const FALLBACK_CPP = (title: string, questionId: string, label: string) => `/*
  * ${questionId}. ${title}
  * https://leetcode.com/problems/${slugify(title)}/
+ *
+ * Sample input: ${label}_input.txt
+ * Run: g++ -O2 -o sol ${label}_${sanitizeFilename(title)}.cpp && ./sol < ${label}_input.txt
  */
 
 #include <bits/stdc++.h>
@@ -45,17 +137,58 @@ public:
 int main() {
     ios_base::sync_with_stdio(false);
     cin.tie(NULL);
+    // freopen("${label}_input.txt", "r", stdin);
 
     return 0;
 }
 `;
 
-function slugify(title: string): string {
-  return title
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, "")
-    .replace(/\s+/g, "-");
+function wrapSnippet(
+  snippet: string,
+  title: string,
+  questionSlug: string,
+  label: string
+): string {
+  const baseName = `${label}_${sanitizeFilename(title)}`;
+  return `/*
+ * ${title}
+ * https://leetcode.com/problems/${questionSlug}/
+ *
+ * Sample input: ${label}_input.txt
+ * Run: g++ -O2 -o sol ${baseName}.cpp && ./sol < ${label}_input.txt
+ */
+
+#include <bits/stdc++.h>
+using namespace std;
+
+${snippet}
+`;
 }
+
+function buildMarkdown(
+  q: ContestQuestion,
+  label: string,
+  difficulty: string,
+  content: string | null
+): string {
+  const url = `https://leetcode.com/problems/${q.titleSlug}/`;
+  const header = [
+    `# ${label}. ${q.title}`,
+    "",
+    `**Difficulty:** ${difficulty || "Unknown"} · [Open on LeetCode](${url})`,
+    "",
+    "---",
+    "",
+  ].join("\n");
+
+  const body = content
+    ? htmlToMarkdown(content)
+    : "*Problem statement not available yet.*";
+
+  return header + body + "\n";
+}
+
+// ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 function httpsGet(
   url: string,
@@ -116,6 +249,8 @@ function httpsPost(
   });
 }
 
+// ── Auth ──────────────────────────────────────────────────────────────────────
+
 async function buildAuth(sessionCookie: string): Promise<Auth | null> {
   try {
     const { cookies } = await httpsGet("https://leetcode.com/", {
@@ -134,11 +269,13 @@ async function buildAuth(sessionCookie: string): Promise<Auth | null> {
     }
 
     if (!csrfToken) {
-      out.appendLine("[auth] No csrftoken in Set-Cookie. Response cookies: " + cookies.join(" | "));
+      out.appendLine(
+        "[auth] No csrftoken in Set-Cookie. Cookies: " + cookies.join(" | ")
+      );
       return null;
     }
 
-    out.appendLine(`[auth] csrftoken obtained: ${csrfToken.slice(0, 8)}…`);
+    out.appendLine(`[auth] csrftoken: ${csrfToken.slice(0, 8)}…`);
     return {
       csrfToken,
       sessionCookie,
@@ -150,6 +287,8 @@ async function buildAuth(sessionCookie: string): Promise<Auth | null> {
   }
 }
 
+// ── LeetCode API ──────────────────────────────────────────────────────────────
+
 async function fetchContestInfo(
   titleSlug: string,
   auth: Auth
@@ -159,78 +298,89 @@ async function fetchContestInfo(
       contest(titleSlug: $titleSlug) {
         title
         titleSlug
-        questions {
-          questionId
-          title
-          titleSlug
-        }
+        questions { questionId title titleSlug }
       }
     }
   `;
 
-  const body = JSON.stringify({ query, variables: { titleSlug } });
-
   try {
-    const raw = await httpsPost("https://leetcode.com/graphql", body, {
-      Referer: `https://leetcode.com/contest/${titleSlug}/`,
-      "User-Agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-      "x-csrftoken": auth.csrfToken,
-      Cookie: auth.cookieHeader,
-    });
+    const raw = await httpsPost(
+      "https://leetcode.com/graphql",
+      JSON.stringify({ query, variables: { titleSlug } }),
+      {
+        Referer: `https://leetcode.com/contest/${titleSlug}/`,
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "x-csrftoken": auth.csrfToken,
+        Cookie: auth.cookieHeader,
+      }
+    );
 
     out.appendLine(`[contest] ${raw.slice(0, 400)}`);
     const json = JSON.parse(raw);
-    if (json?.data?.contest) {
-      return json.data.contest as ContestInfo;
-    }
-    return null;
+    return (json?.data?.contest as ContestInfo) ?? null;
   } catch (e) {
     out.appendLine(`[contest] Error: ${e}`);
     return null;
   }
 }
 
-async function fetchCppSnippet(
+async function fetchQuestionData(
   questionSlug: string,
   contestSlug: string,
   auth: Auth
-): Promise<string | null> {
+): Promise<QuestionData> {
   const query = `
-    query questionEditorData($titleSlug: String!) {
+    query questionData($titleSlug: String!) {
       question(titleSlug: $titleSlug) {
-        codeSnippets {
-          lang
-          langSlug
-          code
-        }
+        difficulty
+        content
+        exampleTestcases
+        codeSnippets { lang langSlug code }
       }
     }
   `;
 
-  const body = JSON.stringify({ query, variables: { titleSlug: questionSlug } });
-
   try {
-    const raw = await httpsPost("https://leetcode.com/graphql", body, {
-      Referer: `https://leetcode.com/contest/${contestSlug}/problems/${questionSlug}/`,
-      "User-Agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-      "x-csrftoken": auth.csrfToken,
-      Cookie: auth.cookieHeader,
-    });
-
-    out.appendLine(`[snippet:${questionSlug}] ${raw.slice(0, 300)}`);
-    const json = JSON.parse(raw);
-    const snippets: CodeSnippet[] = json?.data?.question?.codeSnippets ?? [];
-    out.appendLine(
-      `[snippet:${questionSlug}] langs: ${snippets.map((s) => s.langSlug).join(", ") || "none"}`
+    const raw = await httpsPost(
+      "https://leetcode.com/graphql",
+      JSON.stringify({ query, variables: { titleSlug: questionSlug } }),
+      {
+        Referer: `https://leetcode.com/contest/${contestSlug}/problems/${questionSlug}/`,
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "x-csrftoken": auth.csrfToken,
+        Cookie: auth.cookieHeader,
+      }
     );
-    return snippets.find((s) => s.langSlug === "cpp")?.code ?? null;
+
+    out.appendLine(`[question:${questionSlug}] ${raw.slice(0, 300)}`);
+    const json = JSON.parse(raw);
+    const q = json?.data?.question;
+    if (!q) {
+      return { snippet: null, content: null, difficulty: "", exampleTestcases: null };
+    }
+
+    const snippets: { lang: string; langSlug: string; code: string }[] =
+      q.codeSnippets ?? [];
+    const cpp = snippets.find((s) => s.langSlug === "cpp");
+    out.appendLine(
+      `[question:${questionSlug}] langs: ${snippets.map((s) => s.langSlug).join(", ") || "none"}`
+    );
+
+    return {
+      snippet: cpp?.code ?? null,
+      content: q.content ?? null,
+      difficulty: q.difficulty ?? "",
+      exampleTestcases: q.exampleTestcases ?? null,
+    };
   } catch (e) {
-    out.appendLine(`[snippet:${questionSlug}] Error: ${e}`);
-    return null;
+    out.appendLine(`[question:${questionSlug}] Error: ${e}`);
+    return { snippet: null, content: null, difficulty: "", exampleTestcases: null };
   }
 }
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function extractContestSlug(input: string): string | null {
   const urlMatch = input.match(/leetcode\.com\/contest\/([\w-]+)/);
@@ -243,30 +393,8 @@ function extractContestSlug(input: string): string | null {
   return null;
 }
 
-function extractContestNumber(titleSlug: string): string {
-  const match = titleSlug.match(/(\d+)$/);
-  return match ? match[1] : titleSlug;
-}
-
 function sanitizeFilename(name: string): string {
   return name.replace(/[^a-zA-Z0-9_\-. ]/g, "").replace(/\s+/g, "_");
-}
-
-function wrapSnippet(
-  snippet: string,
-  title: string,
-  questionSlug: string
-): string {
-  return `/*
- * ${title}
- * https://leetcode.com/problems/${questionSlug}/
- */
-
-#include <bits/stdc++.h>
-using namespace std;
-
-${snippet}
-`;
 }
 
 async function getSessionCookie(
@@ -280,7 +408,7 @@ async function getSessionCookie(
   const value = await vscode.window.showInputBox({
     prompt:
       "Enter your LeetCode session cookie (LEETCODE_SESSION). " +
-      "Get it from browser DevTools → Application → Cookies → leetcode.com → LEETCODE_SESSION",
+      "Get it: browser DevTools → Application → Cookies → leetcode.com → LEETCODE_SESSION",
     placeHolder: "eyJ0eXAiOiJKV1QiLCJhbGci…",
     password: true,
     ignoreFocusOut: true,
@@ -294,20 +422,18 @@ async function getSessionCookie(
   return undefined;
 }
 
+// ── Extension entry point ─────────────────────────────────────────────────────
+
 export function activate(context: vscode.ExtensionContext) {
   out = vscode.window.createOutputChannel("LeetCode Contest");
 
-  // Command to clear saved session (re-login)
   context.subscriptions.push(
-    vscode.commands.registerCommand(
-      "leetcode-contest.clearSession",
-      async () => {
-        await context.globalState.update("leetcodeSession", undefined);
-        vscode.window.showInformationMessage(
-          "LeetCode session cleared. You will be prompted on the next join."
-        );
-      }
-    )
+    vscode.commands.registerCommand("leetcode-contest.clearSession", async () => {
+      await context.globalState.update("leetcodeSession", undefined);
+      vscode.window.showInformationMessage(
+        "LeetCode session cleared. You will be prompted on the next join."
+      );
+    })
   );
 
   context.subscriptions.push(
@@ -317,7 +443,7 @@ export function activate(context: vscode.ExtensionContext) {
         out.clear();
         out.show(true);
 
-        // 1. Get session cookie
+        // 1. Session cookie
         const sessionCookie = await getSessionCookie(context);
         if (!sessionCookie) {
           vscode.window.showErrorMessage(
@@ -326,7 +452,7 @@ export function activate(context: vscode.ExtensionContext) {
           return;
         }
 
-        // 2. Ask for contest URL or slug
+        // 2. Contest URL / slug
         const input = await vscode.window.showInputBox({
           prompt: "Enter LeetCode contest URL or slug",
           placeHolder:
@@ -348,7 +474,7 @@ export function activate(context: vscode.ExtensionContext) {
 
         const titleSlug = extractContestSlug(input)!;
 
-        // 3. Determine workspace root
+        // 3. Workspace root
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (!workspaceFolders?.length) {
           vscode.window.showErrorMessage(
@@ -358,8 +484,11 @@ export function activate(context: vscode.ExtensionContext) {
         }
         const workspaceRoot = workspaceFolders[0].uri.fsPath;
 
-        // 4. Auth + fetch contest + fetch snippets
-        type FetchResult = { contest: ContestInfo; snippets: (string | null)[] };
+        // 4. Fetch everything
+        type FetchResult = {
+          contest: ContestInfo;
+          questionData: QuestionData[];
+        };
 
         const result = await vscode.window.withProgress<FetchResult | null>(
           {
@@ -371,9 +500,7 @@ export function activate(context: vscode.ExtensionContext) {
             progress.report({ message: "Authenticating…" });
             const auth = await buildAuth(sessionCookie);
             if (!auth) {
-              out.appendLine(
-                "[error] Could not build auth — session cookie may be expired."
-              );
+              out.appendLine("[error] Auth failed — session cookie may be expired.");
               return null;
             }
 
@@ -383,24 +510,23 @@ export function activate(context: vscode.ExtensionContext) {
               return null;
             }
             if (!contest.questions?.length) {
-              return { contest, snippets: [] };
+              return { contest, questionData: [] };
             }
 
             progress.report({
-              message: `Fetching ${contest.questions.length} C++ templates…`,
+              message: `Fetching ${contest.questions.length} problems…`,
             });
-            const snippets = await Promise.all(
+            const questionData = await Promise.all(
               contest.questions.map((q) =>
-                fetchCppSnippet(q.titleSlug, titleSlug, auth)
+                fetchQuestionData(q.titleSlug, titleSlug, auth)
               )
             );
 
-            return { contest, snippets };
+            return { contest, questionData };
           }
         );
 
         if (!result) {
-          // Offer to re-enter session in case it was stale
           const action = await vscode.window.showErrorMessage(
             `Could not fetch contest "${titleSlug}". Session cookie may be expired.`,
             "Re-enter Session Cookie"
@@ -411,7 +537,7 @@ export function activate(context: vscode.ExtensionContext) {
           return;
         }
 
-        const { contest, snippets } = result;
+        const { contest, questionData } = result;
         const folderName = sanitizeFilename(contest.title).replace(/\s+/g, "_");
         const contestDir = path.join(workspaceRoot, folderName);
 
@@ -426,40 +552,79 @@ export function activate(context: vscode.ExtensionContext) {
           return;
         }
 
-        // 5. Create .cpp files
-        const createdFiles: string[] = [];
+        // 5. Write files
+        const cppFiles: string[] = [];
+        const mdFiles: string[] = [];
+
         for (let i = 0; i < contest.questions.length; i++) {
           const q = contest.questions[i];
+          const { snippet, content, difficulty, exampleTestcases } = questionData[i];
           const label = String.fromCharCode(65 + i);
-          const filename = `${label}_${sanitizeFilename(q.title)}.cpp`;
-          const filepath = path.join(contestDir, filename);
+          const baseName = `${label}_${sanitizeFilename(q.title)}`;
 
-          if (!fs.existsSync(filepath)) {
-            const snippet = snippets[i];
+          // .cpp
+          const cppPath = path.join(contestDir, baseName + ".cpp");
+          if (!fs.existsSync(cppPath)) {
+            const cppContent = snippet
+              ? wrapSnippet(snippet, q.title, q.titleSlug, label)
+              : FALLBACK_CPP(q.title, q.questionId, label);
+            fs.writeFileSync(cppPath, cppContent);
             out.appendLine(
-              `[file] ${filename} — ${snippet ? "LeetCode template" : "fallback"}`
+              `[cpp] ${baseName}.cpp — ${snippet ? "LeetCode template" : "fallback"}`
             );
-            const content = snippet
-              ? wrapSnippet(snippet, q.title, q.titleSlug)
-              : FALLBACK_TEMPLATE(q.title, q.questionId);
-            fs.writeFileSync(filepath, content);
           } else {
-            out.appendLine(`[file] ${filename} — already exists, skipped`);
+            out.appendLine(`[cpp] ${baseName}.cpp — already exists, skipped`);
           }
-          createdFiles.push(filepath);
+          cppFiles.push(cppPath);
+
+          // _input.txt
+          const inputPath = path.join(contestDir, `${label}_input.txt`);
+          if (!fs.existsSync(inputPath)) {
+            const inputContent = exampleTestcases
+              ? exampleTestcases.trim() + "\n"
+              : "# No sample input available yet\n";
+            fs.writeFileSync(inputPath, inputContent);
+            out.appendLine(
+              `[txt] ${label}_input.txt — ${exampleTestcases ? "sample test cases" : "placeholder"}`
+            );
+          } else {
+            out.appendLine(`[txt] ${label}_input.txt — already exists, skipped`);
+          }
+
+          // .md
+          const mdPath = path.join(contestDir, baseName + ".md");
+          if (!fs.existsSync(mdPath)) {
+            fs.writeFileSync(
+              mdPath,
+              buildMarkdown(q, label, difficulty, content)
+            );
+            out.appendLine(
+              `[md]  ${baseName}.md — ${content ? "problem statement" : "placeholder"}`
+            );
+          } else {
+            out.appendLine(`[md]  ${baseName}.md — already exists, skipped`);
+          }
+          mdFiles.push(mdPath);
         }
 
-        // 6. Open all files
-        for (const filepath of createdFiles) {
-          const doc = await vscode.workspace.openTextDocument(filepath);
+        // 6. Open files: .cpp editors + .md previews side-by-side
+        for (const cppPath of cppFiles) {
+          const doc = await vscode.workspace.openTextDocument(cppPath);
           await vscode.window.showTextDocument(doc, {
             preview: false,
-            viewColumn: vscode.ViewColumn.Active,
+            viewColumn: vscode.ViewColumn.One,
           });
         }
 
+        for (const mdPath of mdFiles) {
+          await vscode.commands.executeCommand(
+            "markdown.showPreviewToSide",
+            vscode.Uri.file(mdPath)
+          );
+        }
+
         vscode.window.showInformationMessage(
-          `Contest "${contest.title}" ready! ${createdFiles.length} files in "${folderName}".`
+          `Contest "${contest.title}" ready! ${cppFiles.length} problems in "${folderName}".`
         );
       }
     )
